@@ -310,6 +310,8 @@ func (a *Appender) flush(ctx context.Context, bulkIndexer *BulkIndexer) error {
 			case errFailed.tooMany:
 				a.tooManyRequests.Add(a.tooManyRequests.Load())
 				status = "TooMany"
+			case errFailed.payloadTooLarge:
+				status = "PayloadTooLarge"
 			case errFailed.clientError:
 				status = "FailedClient"
 			case errFailed.serverError:

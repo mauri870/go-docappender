@@ -429,6 +429,11 @@ func (b *BulkIndexer) newBulkIndexRequest(ctx context.Context) (*http.Request, e
 
 // Flush executes a bulk request if there are any items buffered, and clears out the buffer.
 func (b *BulkIndexer) Flush(ctx context.Context) (BulkIndexerResponseStat, error) {
+	return b.flushWithDepth(ctx, 0)
+}
+
+// flushWithDepth is the internal flush method that tracks recursion depth for 413 handling.
+func (b *BulkIndexer) flushWithDepth(ctx context.Context, depth int) (BulkIndexerResponseStat, error) {
 	if b.itemsAdded == 0 {
 		return BulkIndexerResponseStat{}, nil
 	}
@@ -450,15 +455,18 @@ func (b *BulkIndexer) Flush(ctx context.Context) (BulkIndexerResponseStat, error
 
 	bytesFlushed := b.buf.Len()
 	bytesUncompFlushed := b.writer.bytesWritten
+	originalItemsAdded := b.itemsAdded // Capture before reset
+
+	// Capture original bulk request body before making request for potential 413 handling
+	bodyBuf := make([]byte, len(b.buf.Bytes()))
+	copy(bodyBuf, b.buf.Bytes())
+
 	res, err := b.config.Client.Perform(req)
 	if err != nil {
 		b.resetBuf()
 		return BulkIndexerResponseStat{}, fmt.Errorf("failed to execute the request: %w", err)
 	}
 	defer res.Body.Close()
-
-	// original bulk request body
-	bodyBuf := b.buf.Bytes()
 
 	// Reset the buffer and gzip writer so they can be reused in case
 	// document level retries are needed.
@@ -499,6 +507,13 @@ func (b *BulkIndexer) Flush(ctx context.Context) (BulkIndexerResponseStat, error
 		}
 		e := ErrorFlushFailed{resp: s, statusCode: res.StatusCode}
 		switch {
+		case res.StatusCode == 413:
+			e.payloadTooLarge = true
+			e.clientError = true
+			// Handle 413 (Request Entity Too Large) by splitting batch
+			if originalItemsAdded > 1 {
+				return b.handlePayloadTooLarge(ctx, bodyBuf, originalItemsAdded, depth)
+			}
 		case res.StatusCode == 429:
 			e.tooMany = true
 		case res.StatusCode >= 500:
@@ -699,6 +714,119 @@ func (b *BulkIndexer) Flush(ctx context.Context) (BulkIndexerResponseStat, error
 	return resp, nil
 }
 
+// handlePayloadTooLarge splits the current batch into two smaller batches and flushes them recursively.
+// It continues splitting until batches are small enough or we reach maximum recursion depth.
+func (b *BulkIndexer) handlePayloadTooLarge(ctx context.Context, bodyBuf []byte, originalItemsAdded int, depth int) (BulkIndexerResponseStat, error) {
+	const maxRecursionDepth = 10 // Prevent infinite recursion
+	if depth >= maxRecursionDepth {
+		return BulkIndexerResponseStat{}, fmt.Errorf("maximum recursion depth (%d) exceeded for 413 handling", maxRecursionDepth)
+	}
+
+	// Split the batch in half
+	midPoint := originalItemsAdded / 2
+	if midPoint == 0 {
+		// This shouldn't happen since we check originalItemsAdded > 1 before calling this
+		return BulkIndexerResponseStat{}, fmt.Errorf("cannot split batch of size %d", originalItemsAdded)
+	}
+
+	// Reconstruct and flush first half
+	if err := b.reconstructBatchRange(bodyBuf, 0, midPoint); err != nil {
+		return BulkIndexerResponseStat{}, fmt.Errorf("failed to reconstruct first half batch: %w", err)
+	}
+	resp1, err1 := b.flushWithDepth(ctx, depth+1)
+
+	// Reconstruct and flush second half
+	if err := b.reconstructBatchRange(bodyBuf, midPoint, originalItemsAdded); err != nil {
+		return BulkIndexerResponseStat{}, fmt.Errorf("failed to reconstruct second half batch: %w", err)
+	}
+	resp2, err2 := b.flushWithDepth(ctx, depth+1)
+
+	// Combine responses
+	combined := BulkIndexerResponseStat{
+		Indexed:     resp1.Indexed + resp2.Indexed,
+		RetriedDocs: resp1.RetriedDocs + resp2.RetriedDocs,
+	}
+	combined.FailureStoreDocs.Used = resp1.FailureStoreDocs.Used + resp2.FailureStoreDocs.Used
+	combined.FailureStoreDocs.Failed = resp1.FailureStoreDocs.Failed + resp2.FailureStoreDocs.Failed
+	combined.FailureStoreDocs.NotEnabled = resp1.FailureStoreDocs.NotEnabled + resp2.FailureStoreDocs.NotEnabled
+
+	if resp1.GreatestRetry > combined.GreatestRetry {
+		combined.GreatestRetry = resp1.GreatestRetry
+	}
+	if resp2.GreatestRetry > combined.GreatestRetry {
+		combined.GreatestRetry = resp2.GreatestRetry
+	}
+
+	// Combine failed docs, adjusting positions for second half
+	combined.FailedDocs = append(combined.FailedDocs, resp1.FailedDocs...)
+	for _, doc := range resp2.FailedDocs {
+		doc.Position += midPoint
+		combined.FailedDocs = append(combined.FailedDocs, doc)
+	}
+
+	// Update our byte counters (accumulated from both flushes)
+	// Note: bytesFlushed and bytesUncompFlushed are already updated in flushWithDepth
+
+	// Return first error if any
+	if err1 != nil {
+		return combined, err1
+	}
+	return combined, err2
+}
+
+// reconstructBatchRange recreates a batch from the original buffer for the specified item range.
+// This reuses the existing logic similar to document-level retries.
+func (b *BulkIndexer) reconstructBatchRange(bodyBuf []byte, startItem, endItem int) error {
+	var buf []byte
+	var gr *gzip.Reader
+	var err error
+
+	if b.gzipw != nil {
+		// Decompress the buffer (similar to existing retry logic)
+		gr, err = gzip.NewReader(bytes.NewReader(bodyBuf))
+		if err != nil {
+			return fmt.Errorf("failed to create gzip reader: %w", err)
+		}
+		defer gr.Close()
+
+		buf, err = io.ReadAll(gr)
+		if err != nil {
+			return fmt.Errorf("failed to decompress buffer: %w", err)
+		}
+	} else {
+		buf = bodyBuf
+	}
+
+	// Clear current buffer AFTER we've read from bodyBuf
+	b.resetBuf()
+
+	// Each item consists of 2 lines: action line and document line
+	startLine := startItem * 2
+	endLine := endItem * 2
+
+	// Find line boundaries
+	lines := bytes.Split(buf, []byte("\n"))
+	if endLine > len(lines) {
+		endLine = len(lines)
+	}
+
+	// Write the selected lines (reusing existing writeItemAtPos pattern)
+	for i := startLine; i < endLine; i++ {
+		if len(lines[i]) > 0 { // Skip empty lines
+			if _, err := b.writer.Write(lines[i]); err != nil {
+				return fmt.Errorf("failed to write line: %w", err)
+			}
+			if _, err := b.writer.Write([]byte("\n")); err != nil {
+				return fmt.Errorf("failed to write newline: %w", err)
+			}
+		}
+	}
+
+	// Update item count
+	b.itemsAdded = endItem - startItem
+	return nil
+}
+
 func (b *BulkIndexer) shouldRetryOnStatus(docStatus int) bool {
 	for _, status := range b.config.RetryOnDocumentStatus {
 		if docStatus == status {
@@ -725,11 +853,12 @@ func indexnth(s []byte, nth int, sep rune) int {
 }
 
 type ErrorFlushFailed struct {
-	resp        string
-	statusCode  int
-	tooMany     bool
-	clientError bool
-	serverError bool
+	resp            string
+	statusCode      int
+	tooMany         bool
+	clientError     bool
+	serverError     bool
+	payloadTooLarge bool
 }
 
 func (e ErrorFlushFailed) StatusCode() int {
