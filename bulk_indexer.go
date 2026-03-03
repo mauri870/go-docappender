@@ -94,6 +94,8 @@ type BulkIndexerResponseStat struct {
 	GreatestRetry int
 	// FailedDocs contains the failed documents.
 	FailedDocs []BulkIndexerResponseItem
+	// RequestRetries contains the number of times the bulk request was retried due to a retryable status code in the response.
+	RequestRetries int
 }
 
 // BulkIndexerResponseItem represents the Elasticsearch response item.
@@ -429,19 +431,20 @@ func (b *BulkIndexer) newBulkIndexRequest(ctx context.Context) (*http.Request, e
 
 // Flush executes a bulk request if there are any items buffered, and clears out the buffer.
 func (b *BulkIndexer) Flush(ctx context.Context) (BulkIndexerResponseStat, error) {
+	var resp BulkIndexerResponseStat
 	if b.itemsAdded == 0 {
-		return BulkIndexerResponseStat{}, nil
+		return resp, nil
 	}
 
 	if b.gzipw != nil {
 		if err := b.gzipw.Close(); err != nil {
-			return BulkIndexerResponseStat{}, fmt.Errorf("failed closing the gzip writer: %w", err)
+			return resp, fmt.Errorf("failed closing the gzip writer: %w", err)
 		}
 	}
 
 	req, err := b.newBulkIndexRequest(ctx)
 	if err != nil {
-		return BulkIndexerResponseStat{}, fmt.Errorf("failed to create bulk index request: %w", err)
+		return resp, fmt.Errorf("failed to create bulk index request: %w", err)
 	}
 
 	if b.gzipw != nil {
@@ -450,10 +453,13 @@ func (b *BulkIndexer) Flush(ctx context.Context) (BulkIndexerResponseStat, error
 
 	bytesFlushed := b.buf.Len()
 	bytesUncompFlushed := b.writer.bytesWritten
-	res, err := b.config.Client.Perform(req)
+	res, resStats, err := b.config.Client.PerformWithStats(req)
+	if resStats.RequestsRetried > 0 {
+		resp.RequestRetries = resStats.RequestsRetried
+	}
 	if err != nil {
 		b.resetBuf()
-		return BulkIndexerResponseStat{}, fmt.Errorf("failed to execute the request: %w", err)
+		return resp, fmt.Errorf("failed to execute the request: %w", err)
 	}
 	defer res.Body.Close()
 
@@ -468,7 +474,6 @@ func (b *BulkIndexer) Flush(ctx context.Context) (BulkIndexerResponseStat, error
 	// not have been sent otherwise.
 	b.bytesFlushed = bytesFlushed
 	b.bytesUncompFlushed = bytesUncompFlushed
-	var resp BulkIndexerResponseStat
 	if res.StatusCode > 299 {
 		var s string
 		if b.config.IncludeSourceOnError == Unset {
@@ -493,7 +498,7 @@ func (b *BulkIndexer) Flush(ctx context.Context) (BulkIndexerResponseStat, error
 		} else {
 			b, err := io.ReadAll(res.Body)
 			if err != nil {
-				return BulkIndexerResponseStat{}, fmt.Errorf("failed to read response body: %w", err)
+				return resp, fmt.Errorf("failed to read response body: %w", err)
 			}
 			s = string(b)
 		}

@@ -41,3 +41,5 @@ require (
 	gopkg.in/yaml.v3 v3.0.1 // indirect
 	howett.net/plist v1.0.0 // indirect
 )
+
+replace github.com/elastic/elastic-transport-go/v8 => ../elastic-transport-go

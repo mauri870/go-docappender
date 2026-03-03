@@ -33,6 +33,7 @@ import (
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 
+	"github.com/elastic/elastic-transport-go/v8/elastictransport"
 	"github.com/elastic/go-docappender/v2"
 	"github.com/elastic/go-docappender/v2/docappendertest"
 )
@@ -853,4 +854,53 @@ func TestPopulateFailedDocsInput(t *testing.T) {
 			}
 		})
 	}
+}
+
+func TestBulkIndexerRequestsRetriedMetric(t *testing.T) {
+	var requestCount atomic.Int64
+
+	config := docappendertest.NewMockElasticsearchClientConfig(t, func(w http.ResponseWriter, r *http.Request) {
+		requestCount.Add(1)
+
+		// always fail
+		w.WriteHeader(http.StatusTooManyRequests)
+		w.Write([]byte("Too Many Requests"))
+	})
+
+	// Enable retries
+	config.DisableRetry = false
+	config.RetryOnStatus = []int{429}
+	config.MaxRetries = 3
+	config.RetryBackoff = func(i int) time.Duration {
+		return time.Millisecond * 10
+	}
+
+	clientWithRetries, err := elastictransport.New(config)
+	require.NoError(t, err)
+
+	indexer, err := docappender.NewBulkIndexer(docappender.BulkIndexerConfig{
+		Client: clientWithRetries,
+	})
+	require.NoError(t, err)
+
+	// Add some documents
+	for i := 0; i < 10; i++ {
+		require.NoError(t, indexer.Add(docappender.BulkIndexerItem{
+			Index: "testidx",
+			Body: newJSONReader(map[string]any{
+				"@timestamp": time.Now().Format(docappendertest.TimestampFormat),
+				"message":    fmt.Sprintf("test document %d", i),
+			}),
+		}))
+	}
+
+	// should fail and trigger retries, then eventually exhaust retries
+	stats, err := indexer.Flush(t.Context())
+	require.Error(t, err, "Expected flush to fail due to retries being exhausted")
+
+	// assert that we exhausted retries
+	assert.Equal(t, config.MaxRetries+1, int(requestCount.Load()), "Expected all retries to be exhausted")
+
+	// and the metric matches the number of request retries
+	assert.Equal(t, config.MaxRetries, stats.RequestRetries, "expected stats retries to match http retries")
 }
