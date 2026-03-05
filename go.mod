@@ -42,4 +42,4 @@ require (
 	howett.net/plist v1.0.0 // indirect
 )
 
-replace github.com/elastic/elastic-transport-go/v8 => ../elastic-transport-go
+replace github.com/elastic/elastic-transport-go/v8 => github.com/mauri870/elastic-transport-go/v8 v8.0.0-20260302182637-b75374758b3f
